@@ -1,5 +1,5 @@
 customElements.whenDefined("card-tools").then(() => {
-  var ct = customElements.get("card-tools");
+  const ct = customElements.get("card-tools");
 
   const BUILTIN_ACTIONS = [
     {
@@ -14,10 +14,11 @@ customElements.whenDefined("card-tools").then(() => {
   ];
 
   const matchAndReplace = (text, matches) => {
-    for (var i = 0; i < matches.length; i++) {
-      text = text.replace("{" + i + "}", matches[i]);
+    let result = String(text);
+    for (let i = 0; i < matches.length; i++) {
+      result = result.split(`{${i}}`).join(matches[i]);
     }
-    return text;
+    return result;
   };
 
   class SearchCard extends ct.LitElement {
@@ -28,7 +29,6 @@ customElements.whenDefined("card-tools").then(() => {
         _results: { type: Array },
         _activeActions: { type: Array },
         _searchValue: { type: String },
-        _lastHass: { type: Object },
       };
     }
 
@@ -37,13 +37,18 @@ customElements.whenDefined("card-tools").then(() => {
       this._results = [];
       this._activeActions = [];
       this._searchValue = "";
-      this._lastHass = null;
+      this._rowCache = new Map();
+      this._searchIndex = [];
+      this._indexStates = null;
       this._debouncedSearch = this._debounce((searchText) => {
         this._performSearch(searchText);
       }, 100);
     }
 
     shouldUpdate(changedProps) {
+      if (changedProps.has("hass")) {
+        this._propagateHass();
+      }
       return (
         changedProps.has("config") ||
         changedProps.has("_results") ||
@@ -53,6 +58,9 @@ customElements.whenDefined("card-tools").then(() => {
     }
 
     setConfig(config) {
+      if (!config) {
+        throw new Error("Invalid configuration");
+      }
       this.config = config;
       this.max_results = this.config.max_results || 10;
       this.search_text = this.config.search_text || "Type to search...";
@@ -66,7 +74,7 @@ customElements.whenDefined("card-tools").then(() => {
     }
 
     render() {
-      const results = this._results.slice(0, this.max_results).sort();
+      const results = this._results.slice(0, this.max_results);
       const rows = results.map((entity_id) => this._createResultRow(entity_id));
       const actions = this._activeActions.map((x) =>
         this._createActionRow(x[0], x[1])
@@ -115,24 +123,28 @@ customElements.whenDefined("card-tools").then(() => {
     }
 
     _createResultRow(entity_id) {
-      var row = ct.createEntityRow({ entity: entity_id });
-      row.addEventListener("click", () => ct.moreInfo(entity_id));
+      let row = this._rowCache.get(entity_id);
+      if (!row) {
+        row = ct.createEntityRow({ entity: entity_id });
+        row.addEventListener("click", () => ct.moreInfo(entity_id));
+        this._rowCache.set(entity_id, row);
+      }
       row.hass = this.hass;
       return row;
     }
 
     _createActionRow(action, matches) {
-      var service_data = action.service_data;
-      for (var key in service_data) {
-        service_data[key] = matchAndReplace(service_data[key], matches);
+      const service_data = {};
+      for (const [key, value] of Object.entries(action.service_data || {})) {
+        service_data[key] = matchAndReplace(value, matches);
       }
 
-      const elem = cardTools.createThing("service-row", {
+      const elem = ct.createThing("service-row", {
         type: "call",
         name: matchAndReplace(action.name, matches),
         icon: action.icon || "mdi:lamp",
         service: action.service,
-        service_data: service_data,
+        service_data,
       });
       elem.hass = this.hass;
       return elem;
@@ -144,75 +156,121 @@ customElements.whenDefined("card-tools").then(() => {
     }
 
     _clearInput() {
+      this._debouncedSearch.cancel();
       this._searchValue = "";
       this._results = [];
       this._activeActions = [];
+      this._pruneRowCache();
     }
 
     _debounce(func, wait) {
       let timeout;
-      return function executedFunction(...args) {
-        const later = () => {
-          clearTimeout(timeout);
-          func(...args);
-        };
+      const debounced = (...args) => {
         clearTimeout(timeout);
-        timeout = setTimeout(later, wait);
+        timeout = setTimeout(() => func(...args), wait);
       };
+      debounced.cancel = () => clearTimeout(timeout);
+      return debounced;
     }
 
     _performSearch(searchText) {
       if (!this.config || !this.hass || searchText === "") {
         this._results = [];
         this._activeActions = [];
+        this._pruneRowCache();
         return;
       }
 
+      let searchRegex = null;
       try {
-        const searchRegex = new RegExp(searchText, "i");
-        const newResults = [];
+        searchRegex = new RegExp(searchText, "i");
+      } catch {
+        searchRegex = null;
+      }
+      const needle = searchText.toLowerCase();
 
-        for (const entity_id in this.hass.states) {
-          if (
-            (entity_id.search(searchRegex) >= 0 ||
-              this.hass.states[entity_id].attributes.friendly_name?.search(
-                searchRegex
-              ) >= 0) &&
-            (this.included_domains
-              ? this.included_domains.includes(entity_id.split(".")[0])
-              : !this.excluded_domains.includes(entity_id.split(".")[0]))
-          ) {
-            newResults.push(entity_id);
-          }
-        }
+      const newResults = [];
+      for (const entry of this._getSearchIndex()) {
+        if (!entry.allowed) continue;
+        const hit = searchRegex
+          ? searchRegex.test(entry.entity_id) ||
+            (entry.friendly_name ? searchRegex.test(entry.friendly_name) : false)
+          : entry.haystack.includes(needle);
+        if (hit) newResults.push(entry.entity_id);
+      }
+      newResults.sort();
 
-        this._results = newResults;
-        this._activeActions = this._getActivatedActions(searchText);
-      } catch (err) {
-        console.warn(err);
-        this._results = [];
-        this._activeActions = [];
+      this._results = newResults;
+      this._activeActions = this._getActivatedActions(searchText);
+      this._pruneRowCache(newResults);
+    }
+
+    _getSearchIndex() {
+      const states = this.hass?.states;
+      if (!states) return [];
+      if (this._indexStates === states) return this._searchIndex;
+
+      const index = [];
+      for (const entity_id of Object.keys(states)) {
+        const state = states[entity_id];
+        const domain = entity_id.split(".")[0];
+        const friendly_name = state.attributes?.friendly_name;
+        index.push({
+          entity_id,
+          friendly_name,
+          allowed: this.included_domains
+            ? this.included_domains.includes(domain)
+            : !this.excluded_domains.includes(domain),
+          haystack: `${entity_id} ${friendly_name ?? ""}`.toLowerCase(),
+        });
+      }
+
+      this._indexStates = states;
+      this._searchIndex = index;
+      return index;
+    }
+
+    _propagateHass() {
+      if (!this._rowCache || !this.hass) return;
+      for (const row of this._rowCache.values()) {
+        row.hass = this.hass;
+      }
+    }
+
+    _pruneRowCache(results) {
+      if (!this._rowCache) return;
+      if (!results) {
+        this._rowCache.clear();
+        return;
+      }
+      const keep = new Set(results);
+      for (const key of this._rowCache.keys()) {
+        if (!keep.has(key)) this._rowCache.delete(key);
       }
     }
 
     _getActivatedActions(searchText) {
-      var active = [];
+      const active = [];
 
       for (const action of this.actions) {
-        if (this._serviceExists(action.service)) {
-          var matches = searchText.match(action.matches);
-          if (matches != null) {
-            active.push([action, matches]);
-          }
+        if (!this._serviceExists(action.service)) continue;
+        let matches = null;
+        try {
+          matches = searchText.match(action.matches);
+        } catch {
+          continue;
+        }
+        if (matches != null) {
+          active.push([action, matches]);
         }
       }
       return active;
     }
 
     _serviceExists(serviceCall) {
-      var [domain, service] = serviceCall.split(".");
-      var servicesForDomain = this.hass.services[domain];
-      return servicesForDomain && service in servicesForDomain;
+      const [domain, service] = serviceCall.split(".");
+      const servicesForDomain = this.hass?.services?.[domain];
+      return Boolean(servicesForDomain && service in servicesForDomain);
     }
 
     static get styles() {
