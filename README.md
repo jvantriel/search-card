@@ -6,7 +6,7 @@ A Lovelace card for Home Assistant that enables quick entity searching with cust
 
 ## Features
 
-- 🔍 Quick entity search within the Home Assistant frontend
+- 🔍 Quick entity search within the Home Assistant frontend (regex supported, falls back to plain text on invalid regex)
 - ⚡ Custom actions with regex-based matching
 - 🎯 Domain filtering (include/exclude specific domains)
 - 📋 Configurable result limits and placeholder text
