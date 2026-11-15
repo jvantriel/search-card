@@ -64,9 +64,22 @@ customElements.whenDefined("card-tools").then(() => {
       this.config = config;
       this.max_results = this.config.max_results || 10;
       this.search_text = this.config.search_text || "Type to search...";
-      this.actions = BUILTIN_ACTIONS.concat(this.config.actions || []);
+      this.actions = BUILTIN_ACTIONS.concat(this.config.actions || []).map(
+        (action) => {
+          let regex = null;
+          try {
+            regex = new RegExp(action.matches);
+          } catch (err) {
+            console.warn(
+              `search-card: skipping action "${action.name}" with invalid regex: ${err.message}`
+            );
+          }
+          return { ...action, _regex: regex };
+        }
+      );
       this.included_domains = this.config.included_domains;
       this.excluded_domains = this.config.excluded_domains || [];
+      this._indexStates = null;
     }
 
     getCardSize() {
@@ -187,7 +200,6 @@ customElements.whenDefined("card-tools").then(() => {
       } catch {
         searchRegex = null;
       }
-      const needle = searchText.toLowerCase();
 
       const newResults = [];
       for (const entry of this._getSearchIndex()) {
@@ -195,7 +207,7 @@ customElements.whenDefined("card-tools").then(() => {
         const hit = searchRegex
           ? searchRegex.test(entry.entity_id) ||
             (entry.friendly_name ? searchRegex.test(entry.friendly_name) : false)
-          : entry.haystack.includes(needle);
+          : entry.haystack.includes(searchText.toLowerCase());
         if (hit) newResults.push(entry.entity_id);
       }
       newResults.sort();
@@ -251,26 +263,19 @@ customElements.whenDefined("card-tools").then(() => {
 
     _getActivatedActions(searchText) {
       const active = [];
+      const services = this.hass?.services || {};
 
       for (const action of this.actions) {
-        if (!this._serviceExists(action.service)) continue;
-        let matches = null;
-        try {
-          matches = searchText.match(action.matches);
-        } catch {
-          continue;
-        }
-        if (matches != null) {
+        if (!action._regex) continue;
+        const [domain, service] = action.service.split(".");
+        const domainServices = services[domain];
+        if (!domainServices || !(service in domainServices)) continue;
+        const matches = action._regex.exec(searchText);
+        if (matches) {
           active.push([action, matches]);
         }
       }
       return active;
-    }
-
-    _serviceExists(serviceCall) {
-      const [domain, service] = serviceCall.split(".");
-      const servicesForDomain = this.hass?.services?.[domain];
-      return Boolean(servicesForDomain && service in servicesForDomain);
     }
 
     static get styles() {
